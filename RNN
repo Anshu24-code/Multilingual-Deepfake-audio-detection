@@ -3,7 +3,8 @@ import pandas as pd
 import librosa
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.layers import BatchNormalization, Input, Dense, Dropout, Concatenate
+from sklearn.decomposition import PCA
+from tensorflow.keras.layers import BatchNormalization, Input, Dense, Dropout, Concatenate, LSTM
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
@@ -14,35 +15,35 @@ import matplotlib.pyplot as plt
 import os
 
 # Define the audio folder path
-audio_folder_path = r"C:\Users\llal2\Downloads\mixed\mixed"
+audio_folder_path = file path
 
 def extract_features(file_name):
     try:
         audio_path = os.path.join(audio_folder_path, f"{file_name}.mp3")
-        audio, sample_rate = librosa.load(audio_path, sr=None)  # Load audio with its original sampling rate
+        audio, sample_rate = librosa.load(audio_path, sr=None)
 
-        # Extract MFCC features
+        # MFCC features
         mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
         mfccs_scaled = np.mean(mfccs.T, axis=0)
 
-        # Extract Mel spectrogram features
+        # Mel spectrogram features
         mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=sample_rate)
         mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
         mel_spectrogram_scaled = np.mean(mel_spectrogram_db.T, axis=0)
 
-        # Extract pitch frequency
+        # Pitch frequency
         pitches, magnitudes = librosa.piptrack(y=audio, sr=sample_rate)
         pitch_freq = np.mean([pitches[magnitudes[:, i].argmax(), i] for i in range(magnitudes.shape[1])]) if magnitudes.size > 0 else 0
 
-        # Extract onset strength
+        # Onset strength
         onset_strength = librosa.onset.onset_strength(y=audio, sr=sample_rate)
         onset_strength_mean = np.mean(onset_strength) if onset_strength.size > 0 else 0
 
-        # Extract harmonicity (Harmonic-to-Noise Ratio)
+        # Harmonicity
         harmonic = librosa.effects.harmonic(y=audio)
         harmonic_mean = np.mean(harmonic) if harmonic.size > 0 else 0
 
-        # Extract jitter and shimmer
+        # Jitter and shimmer
         fundamental_freqs, _ = librosa.piptrack(y=audio, sr=sample_rate)
         fundamental_freqs = fundamental_freqs[fundamental_freqs > 0]
         jitter = np.std(fundamental_freqs) / np.mean(fundamental_freqs) if len(fundamental_freqs) > 0 else 0
@@ -57,14 +58,13 @@ def extract_features(file_name):
             [pitch_freq, onset_strength_mean, harmonic_mean, jitter, shimmer]
         ))
 
-        # Normalize features
         return (combined_features - np.mean(combined_features)) / np.std(combined_features)
     except Exception as e:
         print(f"Error encountered while parsing file: {file_name}, {e}")
         return None
 
 # Load and process data
-file_path = r"C:\Users\llal2\Downloads\labels.csv"
+file_path = labels csv file path
 data = pd.read_csv(file_path)
 
 # Encode the categorical data
@@ -76,94 +76,103 @@ data['detection'] = le_detection.fit_transform(data['detection'])
 # Extract features
 data['features'] = data['Audio'].apply(lambda x: extract_features(x))
 
-# Convert features to numpy array and handle missing values
+# Replace missing features with the mean value of each feature column
 features_array = np.array(data['features'].tolist())
-features_mean = np.nanmean(features_array, axis=0)
+means = np.nanmean(features_array, axis=0)
+data['features'] = data['features'].apply(lambda x: np.nan_to_num(x, nan=means))
 
-def replace_nan_with_mean(feature_vector):
-    feature_vector = np.array(feature_vector)
-    nan_indices = np.isnan(feature_vector)
-    feature_vector[nan_indices] = features_mean[nan_indices]
-    return feature_vector
+# Save the dataset with features and labels to a CSV file
+features_df = pd.DataFrame(data['features'].tolist())
+features_df['language'] = data['language']
+features_df['detection'] = data['detection']
+features_df.to_csv('features_data_rnn.csv', index=False)
+print(f"Features with labels saved to features_data_rnn.csv")
 
-data['features'] = [replace_nan_with_mean(f) for f in features_array]
+# Ensure there are valid features before proceeding
+if data.empty:
+    print("No valid audio files processed. Check the file paths and formats.")
+else:
+    # Convert features to numpy array
+    X = np.array(data['features'].tolist())
+    y = np.array(data['detection'].tolist())
+    language = np.array(data['language'].tolist())
+    
+    # Dimensionality Reduction
+    pca = PCA(n_components=0.95)  # Retain 95% of variance
+    X_reduced = pca.fit_transform(X)
 
-# Convert features to numpy array
-X = np.array(data['features'].tolist())
-y = np.array(data['detection'].tolist())
-language = np.array(data['language'].tolist())
+    # Expand dimensions for LSTM
+    X_reduced = np.expand_dims(X_reduced, axis=1)
 
-# Define feature labels
-mfcc_labels = [f'mfcc_{i+1}' for i in range(40)]
-mel_labels = [f'mel_{i+1}' for i in range(128)]  # Adjust based on the number of mel features
-additional_labels = ['pitch_freq', 'onset_strength_mean', 'harmonic_mean', 'jitter', 'shimmer']
+    # Split the data into training and testing sets
+    X_train, X_test, y_train, y_test, lang_train, lang_test = train_test_split(X_reduced, y, language, test_size=0.2, random_state=42)
 
-feature_labels = mfcc_labels + mel_labels + additional_labels
+    # Build the LSTM model
+    input_audio = Input(shape=(X_train.shape[1], X_train.shape[2]))  # (timesteps, features)
+    input_lang = Input(shape=(1,))  
 
-# Create DataFrame with proper labels
-features_df = pd.DataFrame(X, columns=feature_labels)
-features_df['language'] = language  # Use integer encoding for language
-features_df['detection'] = y        # Use integer encoding for detection
-features_df.to_csv('features_data_cnn.csv', index=False)
+    # Audio feature layers
+    x = LSTM(128, return_sequences=True)(input_audio)
+    x = Dropout(0.5)(x)
+    x = LSTM(64)(x)
+    x = Dropout(0.5)(x)
+    x = Dense(256, activation='relu')(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.5)(x)
 
-print("Features saved to 'features_data_cnn.csv'")
+    # Language feature layers
+    y_lang = Dense(128, activation='relu')(input_lang)
+    y_lang = Dropout(0.5)(y_lang)
 
-# Split the data into training and testing sets
-X_train, X_test, y_train, y_test, lang_train, lang_test = train_test_split(X, y, language, test_size=0.2, random_state=42)
+    # Concatenate audio and language features
+    combined = Concatenate()([x, y_lang])
 
-# Build the model
-input_audio = Input(shape=(X_train.shape[1],))
-input_lang = Input(shape=(1,))  # Updated to match the encoding (integer) for language
+    # Final output layer
+    z = Dense(256, activation='relu')(combined)
+    z = Dropout(0.5)(z)
+    output = Dense(2, activation='softmax')(z)  
 
-# Audio feature layers with increased dropout
-x = Dense(512, activation='relu')(input_audio)  # Reduced size of the first layer
-x = BatchNormalization()(x)
-x = Dropout(0.7)(x)  # Increased dropout rate
-x = Dense(256, activation='relu')(x)
-x = BatchNormalization()(x)
-x = Dropout(0.7)(x)  # Increased dropout rate
+    model_rnn = Model(inputs=[input_audio, input_lang], outputs=output)
+    model_rnn.compile(loss='categorical_crossentropy', metrics=['accuracy'], optimizer=Adam(learning_rate=0.001))
 
-# Language feature layers with increased dropout
-y_lang = Dense(64, activation='relu')(input_lang)  # Reduced size
-y_lang = Dropout(0.7)(y_lang)  # Increased dropout rate
+    # Early stopping to prevent overfitting
+    early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
 
-# Concatenate audio and language features
-combined = Concatenate()([x, y_lang])
+    # Train the model
+    model_rnn.fit([X_train, lang_train], to_categorical(y_train), epochs=50, batch_size=32, validation_data=([X_test, lang_test], to_categorical(y_test)), callbacks=[early_stopping])
 
-# Final output layer with reduced size
-z = Dense(128, activation='relu')(combined)  # Reduced size
-z = Dropout(0.7)(z)  # Increased dropout rate
-output = Dense(2, activation='softmax')(z)  # Assuming binary classification
+    # Evaluate the model
+    train_loss, train_accuracy = model_rnn.evaluate([X_train, lang_train], to_categorical(y_train), verbose=0)
+    print(f"Training accuracy: {train_accuracy * 100:.2f}%")
 
-model = Model(inputs=[input_audio, input_lang], outputs=output)
-model.compile(loss='categorical_crossentropy', metrics=['accuracy'], optimizer=Adam(learning_rate=0.001))
+    test_loss, test_accuracy = model_rnn.evaluate([X_test, lang_test], to_categorical(y_test), verbose=0)
+    print(f"Test accuracy: {test_accuracy * 100:.2f}%")
 
-# Early stopping to prevent overfitting
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    # Detailed evaluation
+    y_pred_proba = model_rnn.predict([X_test, lang_test])
+    y_pred_classes = np.argmax(y_pred_proba, axis=1)
+    y_true = np.argmax(to_categorical(y_test), axis=1)
 
-# Train the model
-model.fit([X_train, lang_train], to_categorical(y_train), epochs=50, batch_size=32, validation_data=([X_test, lang_test], to_categorical(y_test)), callbacks=[early_stopping])
+    print("Classification Report:\n", classification_report(y_true, y_pred_classes))
 
-# Evaluate the model
-train_loss, train_accuracy = model.evaluate([X_train, lang_train], to_categorical(y_train), verbose=0)
-print(f"Training accuracy: {train_accuracy * 100:.2f}%")
+    conf_matrix = confusion_matrix(y_true, y_pred_classes)
+    plt.figure(figsize=(10,7))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=['Class 0', 'Class 1'], yticklabels=['Class 0', 'Class 1'])
+    plt.xlabel('Predicted Labels')
+    plt.ylabel('True Labels')
+    plt.title('Confusion Matrix')
+    plt.show()
 
-test_loss, test_accuracy = model.evaluate([X_test, lang_test], to_categorical(y_test), verbose=0)
-print(f"Test accuracy: {test_accuracy * 100:.2f}%")
+    # Compute EER
+    def compute_eer(y_true, y_scores):
+        fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+        eer_index = np.nanargmin(np.abs(fpr - (1 - tpr)))
+        eer = (fpr[eer_index] + (1 - tpr[eer_index])) / 2
+        eer_threshold = thresholds[eer_index]
+        return eer, eer_threshold
 
-# Detailed evaluation
-y_pred_proba = model.predict([X_test, lang_test])
-y_pred_classes = np.argmax(y_pred_proba, axis=1)
-y_true = np.argmax(to_categorical(y_test), axis=1)
-
-print("Classification Report:\n", classification_report(y_true, y_pred_classes))
-
-conf_matrix = confusion_matrix(y_true, y_pred_classes)
-plt.figure(figsize=(10,7))
-sns.heatmap(conf_matrix, annot=True, fmt='d')
-plt.xlabel('Predicted')
-plt.ylabel('Actual')
-plt.show()
+    # Get prediction probabilities for the positive class
+    y_pred_proba_pos = y_pred_proba[:, 1]  # Assuming binary classification and positive class is index 1
 
 # Compute EER
 def compute_eer(y_true, y_scores):
