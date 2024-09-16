@@ -1,70 +1,23 @@
 import numpy as np
 import pandas as pd
-import librosa
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.layers import BatchNormalization, Input, Dense, Dropout, Concatenate
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.utils import to_categorical
 from sklearn.metrics import classification_report, confusion_matrix, roc_curve
 import seaborn as sns
 import matplotlib.pyplot as plt
+import torch
+import torchaudio
+from transformers import WhisperProcessor, WhisperModel
+from torch.utils.data import DataLoader, TensorDataset
+from torch import nn
+import torch.optim as optim
 import os
 
 # Define the audio folder path
-audio_folder_path = r"C:\Users\llal2\Downloads\mixed\mixed"
-
-def extract_features(file_name):
-    try:
-        audio_path = os.path.join(audio_folder_path, f"{file_name}.mp3")
-        audio, sample_rate = librosa.load(audio_path, sr=None)  # Load audio with its original sampling rate
-
-        # Extract MFCC features
-        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
-        mfccs_scaled = np.mean(mfccs.T, axis=0)
-
-        # Extract Mel spectrogram features
-        mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=sample_rate)
-        mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
-        mel_spectrogram_scaled = np.mean(mel_spectrogram_db.T, axis=0)
-
-        # Extract pitch frequency
-        pitches, magnitudes = librosa.piptrack(y=audio, sr=sample_rate)
-        pitch_freq = np.mean([pitches[magnitudes[:, i].argmax(), i] for i in range(magnitudes.shape[1])]) if magnitudes.size > 0 else 0
-
-        # Extract onset strength
-        onset_strength = librosa.onset.onset_strength(y=audio, sr=sample_rate)
-        onset_strength_mean = np.mean(onset_strength) if onset_strength.size > 0 else 0
-
-        # Extract harmonicity (Harmonic-to-Noise Ratio)
-        harmonic = librosa.effects.harmonic(y=audio)
-        harmonic_mean = np.mean(harmonic) if harmonic.size > 0 else 0
-
-        # Extract jitter and shimmer
-        fundamental_freqs, _ = librosa.piptrack(y=audio, sr=sample_rate)
-        fundamental_freqs = fundamental_freqs[fundamental_freqs > 0]
-        jitter = np.std(fundamental_freqs) / np.mean(fundamental_freqs) if len(fundamental_freqs) > 0 else 0
-
-        amplitude = np.abs(audio)
-        shimmer = np.std(amplitude) / np.mean(amplitude) if len(amplitude) > 0 else 0
-
-        # Combine features
-        combined_features = np.hstack((
-            mfccs_scaled,
-            mel_spectrogram_scaled,
-            [pitch_freq, onset_strength_mean, harmonic_mean, jitter, shimmer]
-        ))
-
-        # Normalize features
-        return (combined_features - np.mean(combined_features)) / np.std(combined_features)
-    except Exception as e:
-        print(f"Error encountered while parsing file: {file_name}, {e}")
-        return None
+audio_folder_path = file path
 
 # Load and process data
-file_path = r"C:\Users\llal2\Downloads\labels.csv"
+file_path = labels csv file path
 data = pd.read_csv(file_path)
 
 # Encode the categorical data
@@ -73,92 +26,114 @@ le_detection = LabelEncoder()
 data['language'] = le_language.fit_transform(data['language'])
 data['detection'] = le_detection.fit_transform(data['detection'])
 
-# Extract features
-data['features'] = data['Audio'].apply(lambda x: extract_features(x))
+# Function to load and process audio
+def load_audio(file_name):
+    audio_path = os.path.join(audio_folder_path, f"{file_name}.mp3")
+    waveform, sample_rate = torchaudio.load(audio_path)
+    return waveform.squeeze().numpy()
 
-# Convert features to numpy array and handle missing values
-features_array = np.array(data['features'].tolist())
-features_mean = np.nanmean(features_array, axis=0)
+# Load Whisper processor and model
+processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+whisper_model = WhisperModel.from_pretrained("openai/whisper-tiny")
 
-def replace_nan_with_mean(feature_vector):
-    feature_vector = np.array(feature_vector)
-    nan_indices = np.isnan(feature_vector)
-    feature_vector[nan_indices] = features_mean[nan_indices]
-    return feature_vector
+# Extract features using Whisper
+def extract_features(audio):
+    inputs = processor(audio, sampling_rate=16000, return_tensors="pt").input_features
+    with torch.no_grad():
+        outputs = whisper_model.encoder(inputs)
+    return outputs.last_hidden_state.mean(dim=1).squeeze().numpy()
 
-data['features'] = [replace_nan_with_mean(f) for f in features_array]
+# Extract features for all audio files
+data['features'] = data['Audio'].apply(lambda x: extract_features(load_audio(x)))
 
-# Convert features to numpy array
+# Prepare features and labels
 X = np.array(data['features'].tolist())
 y = np.array(data['detection'].tolist())
 language = np.array(data['language'].tolist())
 
-# Define feature labels
-mfcc_labels = [f'mfcc_{i+1}' for i in range(40)]
-mel_labels = [f'mel_{i+1}' for i in range(128)]  # Adjust based on the number of mel features
-additional_labels = ['pitch_freq', 'onset_strength_mean', 'harmonic_mean', 'jitter', 'shimmer']
-
-feature_labels = mfcc_labels + mel_labels + additional_labels
-
-# Create DataFrame with proper labels
-features_df = pd.DataFrame(X, columns=feature_labels)
-features_df['language'] = language  # Use integer encoding for language
-features_df['detection'] = y        # Use integer encoding for detection
-features_df.to_csv('features_data_cnn.csv', index=False)
-
-print("Features saved to 'features_data_cnn.csv'")
-
-# Split the data into training and testing sets
+# Split the data
 X_train, X_test, y_train, y_test, lang_train, lang_test = train_test_split(X, y, language, test_size=0.2, random_state=42)
 
-# Build the model
-input_audio = Input(shape=(X_train.shape[1],))
-input_lang = Input(shape=(1,))  # Updated to match the encoding (integer) for language
+# Define a simple classification model
+class SimpleClassifier(nn.Module):
+    def __init__(self, input_dim):
+        super(SimpleClassifier, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 256)
+        self.fc2 = nn.Linear(256, 128)
+        self.fc3 = nn.Linear(128, 2)  # 2 for binary classification
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
 
-# Audio feature layers with increased dropout
-x = Dense(512, activation='relu')(input_audio)  # Reduced size of the first layer
-x = BatchNormalization()(x)
-x = Dropout(0.7)(x)  # Increased dropout rate
-x = Dense(256, activation='relu')(x)
-x = BatchNormalization()(x)
-x = Dropout(0.7)(x)  # Increased dropout rate
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = self.fc3(x)
+        return x
 
-# Language feature layers with increased dropout
-y_lang = Dense(64, activation='relu')(input_lang)  # Reduced size
-y_lang = Dropout(0.7)(y_lang)  # Increased dropout rate
+# Prepare data loaders
+train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
+test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.LongTensor(y_test))
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-# Concatenate audio and language features
-combined = Concatenate()([x, y_lang])
+# Initialize the model, loss function, and optimizer
+model = SimpleClassifier(X_train.shape[1])
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-# Final output layer with reduced size
-z = Dense(128, activation='relu')(combined)  # Reduced size
-z = Dropout(0.7)(z)  # Increased dropout rate
-output = Dense(2, activation='softmax')(z)  # Assuming binary classification
+# Training loop
+num_epochs = 50
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
 
-model = Model(inputs=[input_audio, input_lang], outputs=output)
-model.compile(loss='categorical_crossentropy', metrics=['accuracy'], optimizer=Adam(learning_rate=0.001))
+for epoch in range(num_epochs):
+    model.train()
+    running_loss = 0.0
+    for batch_features, batch_labels in train_loader:
+        batch_features, batch_labels = batch_features.to(device), batch_labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(batch_features)
+        loss = criterion(outputs, batch_labels)
+        loss.backward()
+        optimizer.step()
 
-# Early stopping to prevent overfitting
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        running_loss += loss.item() * batch_features.size(0)
 
-# Train the model
-model.fit([X_train, lang_train], to_categorical(y_train), epochs=50, batch_size=32, validation_data=([X_test, lang_test], to_categorical(y_test)), callbacks=[early_stopping])
+    epoch_loss = running_loss / len(train_loader.dataset)
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}')
 
-# Evaluate the model
-train_loss, train_accuracy = model.evaluate([X_train, lang_train], to_categorical(y_train), verbose=0)
-print(f"Training accuracy: {train_accuracy * 100:.2f}%")
+# Final evaluation for total training and testing accuracy
+def evaluate_model(loader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    all_probs = []
+    with torch.no_grad():
+        for batch_features, batch_labels in loader:
+            batch_features, batch_labels = batch_features.to(device), batch_labels.to(device)
+            outputs = model(batch_features)
+            _, predicted = torch.max(outputs.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(batch_labels.cpu().numpy())
+            all_probs.extend(torch.softmax(outputs, dim=1).cpu().numpy())
+    return np.array(all_labels), np.array(all_preds), np.array(all_probs)
 
-test_loss, test_accuracy = model.evaluate([X_test, lang_test], to_categorical(y_test), verbose=0)
-print(f"Test accuracy: {test_accuracy * 100:.2f}%")
+train_labels, train_preds, train_probs = evaluate_model(train_loader)
+test_labels, test_preds, test_probs = evaluate_model(test_loader)
 
-# Detailed evaluation
-y_pred_proba = model.predict([X_test, lang_test])
-y_pred_classes = np.argmax(y_pred_proba, axis=1)
-y_true = np.argmax(to_categorical(y_test), axis=1)
+train_accuracy = np.mean(train_preds == train_labels) * 100
+test_accuracy = np.mean(test_preds == test_labels) * 100
 
-print("Classification Report:\n", classification_report(y_true, y_pred_classes))
+print(f'Total Train Accuracy: {train_accuracy:.2f}%')
+print(f'Total Test Accuracy: {test_accuracy:.2f}%')
 
-conf_matrix = confusion_matrix(y_true, y_pred_classes)
+# Detailed classification report for test set
+print("Classification Report:\n", classification_report(test_labels, test_preds))
+
+# Plot confusion matrix
+conf_matrix = confusion_matrix(test_labels, test_preds)
 plt.figure(figsize=(10,7))
 sns.heatmap(conf_matrix, annot=True, fmt='d')
 plt.xlabel('Predicted')
