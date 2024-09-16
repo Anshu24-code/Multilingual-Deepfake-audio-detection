@@ -1,0 +1,195 @@
+import numpy as np
+import pandas as pd
+import librosa
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import BatchNormalization, Input, Dense, Dropout, Concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import to_categorical
+from sklearn.metrics import classification_report, confusion_matrix, roc_curve
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
+
+# Define the audio folder path
+audio_folder_path = filepath
+
+def extract_features(file_name):
+    try:
+        audio_path = os.path.join(audio_folder_path, f"{file_name}.mp3")
+        audio, sample_rate = librosa.load(audio_path, sr=None)  # Load audio with its original sampling rate
+
+        # Extract MFCC features
+        mfccs = librosa.feature.mfcc(y=audio, sr=sample_rate, n_mfcc=40)
+        mfccs_scaled = np.mean(mfccs.T, axis=0)
+
+        # Extract Mel spectrogram features
+        mel_spectrogram = librosa.feature.melspectrogram(y=audio, sr=sample_rate)
+        mel_spectrogram_db = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        mel_spectrogram_scaled = np.mean(mel_spectrogram_db.T, axis=0)
+
+        # Extract pitch frequency
+        pitches, magnitudes = librosa.piptrack(y=audio, sr=sample_rate)
+        pitch_freq = np.mean([pitches[magnitudes[:, i].argmax(), i] for i in range(magnitudes.shape[1])]) if magnitudes.size > 0 else 0
+
+        # Extract onset strength
+        onset_strength = librosa.onset.onset_strength(y=audio, sr=sample_rate)
+        onset_strength_mean = np.mean(onset_strength) if onset_strength.size > 0 else 0
+
+        # Extract harmonicity (Harmonic-to-Noise Ratio)
+        harmonic = librosa.effects.harmonic(y=audio)
+        harmonic_mean = np.mean(harmonic) if harmonic.size > 0 else 0
+
+        # Extract jitter and shimmer
+        fundamental_freqs, _ = librosa.piptrack(y=audio, sr=sample_rate)
+        fundamental_freqs = fundamental_freqs[fundamental_freqs > 0]
+        jitter = np.std(fundamental_freqs) / np.mean(fundamental_freqs) if len(fundamental_freqs) > 0 else 0
+
+        amplitude = np.abs(audio)
+        shimmer = np.std(amplitude) / np.mean(amplitude) if len(amplitude) > 0 else 0
+
+        # Combine features
+        combined_features = np.hstack((
+            mfccs_scaled,
+            mel_spectrogram_scaled,
+            [pitch_freq, onset_strength_mean, harmonic_mean, jitter, shimmer]
+        ))
+
+        # Normalize features
+        return (combined_features - np.mean(combined_features)) / np.std(combined_features)
+    except Exception as e:
+        print(f"Error encountered while parsing file: {file_name}, {e}")
+        return None
+
+# Load and process data
+file_path = labels csv file path
+data = pd.read_csv(file_path)
+
+# Encode the categorical data
+le_language = LabelEncoder()
+le_detection = LabelEncoder()
+data['language'] = le_language.fit_transform(data['language'])
+data['detection'] = le_detection.fit_transform(data['detection'])
+
+# Extract features
+data['features'] = data['Audio'].apply(lambda x: extract_features(x))
+
+# Convert features to numpy array and handle missing values
+features_array = np.array(data['features'].tolist())
+features_mean = np.nanmean(features_array, axis=0)
+
+def replace_nan_with_mean(feature_vector):
+    feature_vector = np.array(feature_vector)
+    nan_indices = np.isnan(feature_vector)
+    feature_vector[nan_indices] = features_mean[nan_indices]
+    return feature_vector
+
+data['features'] = [replace_nan_with_mean(f) for f in features_array]
+
+# Convert features to numpy array
+X = np.array(data['features'].tolist())
+y = np.array(data['detection'].tolist())
+language = np.array(data['language'].tolist())
+
+# Define feature labels
+mfcc_labels = [f'mfcc_{i+1}' for i in range(40)]
+mel_labels = [f'mel_{i+1}' for i in range(128)]  # Adjust based on the number of mel features
+additional_labels = ['pitch_freq', 'onset_strength_mean', 'harmonic_mean', 'jitter', 'shimmer']
+
+feature_labels = mfcc_labels + mel_labels + additional_labels
+
+# Create DataFrame with proper labels
+features_df = pd.DataFrame(X, columns=feature_labels)
+features_df['language'] = language  # Use integer encoding for language
+features_df['detection'] = y        # Use integer encoding for detection
+features_df.to_csv('features_data_cnn.csv', index=False)
+
+print("Features saved to 'features_data_cnn.csv'")
+
+# Split the data into training and testing sets
+X_train, X_test, y_train, y_test, lang_train, lang_test = train_test_split(X, y, language, test_size=0.2, random_state=42)
+
+# Build the model
+input_audio = Input(shape=(X_train.shape[1],))
+input_lang = Input(shape=(1,))  # Updated to match the encoding (integer) for language
+
+# Audio feature layers with increased dropout
+x = Dense(512, activation='relu')(input_audio)  # Reduced size of the first layer
+x = BatchNormalization()(x)
+x = Dropout(0.7)(x)  # Increased dropout rate
+x = Dense(256, activation='relu')(x)
+x = BatchNormalization()(x)
+x = Dropout(0.7)(x)  # Increased dropout rate
+
+# Language feature layers with increased dropout
+y_lang = Dense(64, activation='relu')(input_lang)  # Reduced size
+y_lang = Dropout(0.7)(y_lang)  # Increased dropout rate
+
+# Concatenate audio and language features
+combined = Concatenate()([x, y_lang])
+
+# Final output layer with reduced size
+z = Dense(128, activation='relu')(combined)  # Reduced size
+z = Dropout(0.7)(z)  # Increased dropout rate
+output = Dense(2, activation='softmax')(z)  # Assuming binary classification
+
+model = Model(inputs=[input_audio, input_lang], outputs=output)
+model.compile(loss='categorical_crossentropy', metrics=['accuracy'], optimizer=Adam(learning_rate=0.001))
+
+# Early stopping to prevent overfitting
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
+# Train the model
+model.fit([X_train, lang_train], to_categorical(y_train), epochs=50, batch_size=32, validation_data=([X_test, lang_test], to_categorical(y_test)), callbacks=[early_stopping])
+
+# Evaluate the model
+train_loss, train_accuracy = model.evaluate([X_train, lang_train], to_categorical(y_train), verbose=0)
+print(f"Training accuracy: {train_accuracy * 100:.2f}%")
+
+test_loss, test_accuracy = model.evaluate([X_test, lang_test], to_categorical(y_test), verbose=0)
+print(f"Test accuracy: {test_accuracy * 100:.2f}%")
+
+# Detailed evaluation
+y_pred_proba = model.predict([X_test, lang_test])
+y_pred_classes = np.argmax(y_pred_proba, axis=1)
+y_true = np.argmax(to_categorical(y_test), axis=1)
+
+print("Classification Report:\n", classification_report(y_true, y_pred_classes))
+
+conf_matrix = confusion_matrix(y_true, y_pred_classes)
+plt.figure(figsize=(10,7))
+sns.heatmap(conf_matrix, annot=True, fmt='d')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.show()
+
+# Compute EER
+def compute_eer(y_true, y_scores):
+    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+    eer_index = np.nanargmin(np.abs(fpr - (1 - tpr)))
+    eer = (fpr[eer_index] + (1 - tpr[eer_index])) / 2
+    eer_threshold = thresholds[eer_index]
+    return eer, eer_threshold
+
+# Get prediction probabilities for the positive class
+y_pred_proba_pos = y_pred_proba[:, 1]  # Assuming binary classification and positive class is index 1
+
+# Compute EER
+eer, eer_threshold = compute_eer(y_true, y_pred_proba_pos)
+print(f"EER: {eer:.4f}")
+
+# Compute DCF
+def compute_dcf(y_true, y_scores, threshold, cost_fp=1, cost_fn=1, p_target=0.5):
+    predicted_labels = (y_scores >= threshold).astype(int)
+    fp = np.sum((predicted_labels == 1) & (y_true == 0))
+    fn = np.sum((predicted_labels == 0) & (y_true == 1))
+    p_fa = fp / np.sum(y_true == 0)
+    p_md = fn / np.sum(y_true == 1)
+    dcf = (cost_fp * p_fa + cost_fn * p_md) / (cost_fp * p_target + cost_fn * (1 - p_target))
+    return dcf
+
+# Compute DCF at the EER threshold
+dcf = compute_dcf(y_true, y_pred_proba_pos, threshold=eer_threshold)
+print(f"DCF at EER threshold: {dcf:.4f}")
