@@ -3,14 +3,9 @@ import pandas as pd
 from sklearn.inspection import permutation_importance
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score
 
-# have these defined: `model`, `X_test`, `y_test`, `lang_test`, and `feature_labels` are already defined
-# Ensure you have the correct feature_labels
-feature_labels = [f"Feature {i}" for i in range(X_test.shape[2])]  # Example, replace with actual feature names if available
-
-# Flatten the 3D data (timesteps, features) to 2D (samples, features)
-X_test_flat = X_test.reshape(X_test.shape[0], -1)
+# have this defined: model, X_test, y_test, lang_test, and feature_labels are already defined
 
 class ModelWrapper:
     def __init__(self, model, lang_test):
@@ -22,9 +17,7 @@ class ModelWrapper:
         return self
     
     def predict(self, X):
-        # Ensure X is 2D by reshaping it
-        X_reshaped = X.reshape((X.shape[0], 1, X.shape[1]))
-        return self.model.predict([X_reshaped, np.full(X.shape[0], self.lang_test[0])])[:, 1]
+        return self.model.predict([X, np.full(X.shape[0], self.lang_test[0])])[:, 1]
     
     def score(self, X, y):
         # Implement a scoring method using accuracy_score from sklearn
@@ -32,11 +25,13 @@ class ModelWrapper:
         return accuracy_score(y, y_pred)
 
 # Create an instance of the wrapper
-model_wrapper = ModelWrapper(model_rnn, lang_test)
+# Create an instance of the wrapper
+model_wrapper = ModelWrapper(model, lang_test)
 
 # Perform permutation importance
-r = permutation_importance(model_wrapper, X_test_flat, y_test,
+r = permutation_importance(model_wrapper, X_test, y_test,
                            n_repeats=10, random_state=42, n_jobs=-1)
+
 
 # Create feature importance DataFrame
 feature_importance = pd.DataFrame({
@@ -93,5 +88,5 @@ with open('results_summary.txt', 'w') as f:
     for lang, acc in language_performance.items():
         f.write(f"{lang}: {acc:.4f}\n")
 
-print("Results saved to 'results_summary.txt'")
+print("Results saved to 'results_summary_cnn.txt'")
 print("Visualizations saved as PNG files")
